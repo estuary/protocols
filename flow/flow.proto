@@ -3,6 +3,7 @@ syntax = "proto3";
 package flow;
 option go_package = "github.com/estuary/protocols/flow";
 
+import "google/protobuf/struct.proto";
 import "broker/protocol/protocol.proto";
 import "consumer/protocol/protocol.proto";
 import "gogoproto/gogo.proto";
@@ -624,6 +625,8 @@ message ExtractAPI {
     EXTRACTED_UUID = 3;
     // Fields extracted from a document (Rust -> Go).
     EXTRACTED_FIELDS = 4;
+    // A Log message to be published (Rust -> Go)
+    LOG = 5;
   }
 
   message Config {
@@ -638,6 +641,15 @@ message ExtractAPI {
     // Field JSON pointers to extract from documents and return as packed
     // tuples.
     repeated string field_ptrs = 4;
+    // The current log level, so that log filtering may be done on the Rust side to avoid
+    // (de)serialization of log messages that would be ignored.
+    LogLevel log_level = 5;
+  };
+
+  // Stats related to field extraction.
+  message Stats {
+    DocsAndBytes inputs = 1;
+    uint64 output_bytes = 2;
   };
 };
 
@@ -663,6 +675,10 @@ message CombineAPI {
     DRAINED_KEY = 7;
     // Next drained fields (follows key; Rust -> Go).
     DRAINED_FIELDS = 8;
+    // A Log message to be published (Rust -> Go)
+    LOG = 9;
+    // Drain stats, sent after all documents have been drained. (Rust -> Go)
+    STATS = 10;
   };
 
   message Config {
@@ -683,7 +699,18 @@ message CombineAPI {
     // JSON-Pointer at which a placeholder UUID should be inserted into
     // returned documents. If empty, no placeholder is inserted.
     string uuid_placeholder_ptr = 5;
+    // The current log level, so that log filtering may be done on the Rust side to avoid
+    // (de)serialization of log messages that would be ignored.
+    LogLevel log_level = 6;
   };
+
+  // Stats holds statistics relating to one or more combiner transactions.
+  message Stats {
+    DocsAndBytes left = 1;
+    DocsAndBytes right = 2;
+    DocsAndBytes out = 3;
+  };
+
 };
 
 // DeriveAPI is a meta-message which name spaces messages of the Derive API
@@ -728,6 +755,10 @@ message DeriveAPI {
     PREPARE_TO_COMMIT = 14;
     // Clear registers values (test support only; Go -> Rust).
     CLEAR_REGISTERS = 15;
+    // A Log message to be published (Rust -> Go)
+    LOG = 16;
+    // Drain stats, sent after all documents have been drained. (Rust -> Go)
+    STATS = 17;
   };
 
   // Open the registers database.
@@ -747,6 +778,9 @@ message DeriveAPI {
     // Memory address of a associated SchemaIndex, which must exist for
     // the complete lifetime of this API's use.
     fixed64 schema_index_memptr = 2;
+    // The current log level, so that log filtering may be done on the Rust side to avoid
+    // (de)serialization of log messages that would be ignored.
+    LogLevel log_level = 3;
   }
 
   // DocHeader precedes a JSON-encoded document.
@@ -781,6 +815,37 @@ message DeriveAPI {
   message Prepare {
     // Checkpoint to commit.
     consumer.Checkpoint checkpoint = 1 [ (gogoproto.nullable) = false ];
+  };
+
+  // Stats holds statistics relating to a single derive transaction.
+  message Stats {
+    message InvokeStats {
+      // Number of times that the lambda was invoked.
+      uint64 count = 1;
+      // Sum total duration of all invocations, in seconds.
+      double total_seconds = 2;
+      // The smallest measured invocation duration.
+      double min_seconds = 3;
+      // The largest measured invocation duration.
+      double max_seconds = 4;
+    };
+
+    // Publish lambda invocation stats.
+    InvokeStats publish_lambda = 1;
+    // Update lambda invocation stats.
+    InvokeStats update_lambda = 2;
+
+    // Number of documents and bytes that were read from source collections.
+    DocsAndBytes read = 3;
+    // Number of documents and bytes that were output (published) from this derivation.
+    DocsAndBytes out = 4;
+
+    // The number of new register values that were created and added to the registers database.
+    // In the future, it may be nice to also expose stats related to the size of documents stored
+    // within registers, but it's not obvious how to count updates to existing values as a result of
+    // reductions. So this lone field represents the cerservative subset of register stats that I
+    // feel confident we can and should expose as part of the user-facing stats.
+    uint64 registers_created = 5;
   };
 }
 
@@ -849,6 +914,35 @@ message BuildAPI {
     string resource_url = 1;
     ContentType content_type = 2;
   }
+}
+
+// Log level, you know the drill.
+// This is a separate top-level message because it's included in the Config messages of several
+// services. It's passed to the Rust side so that log filtering may be perfomed directly in Rust,
+// avoiding the need to (de)serialize log messages that would not be published.
+enum LogLevel {
+  ERROR = 0;
+  WARN = 1;
+  INFO = 2;
+  DEBUG = 3;
+  TRACE = 4;
+};
+
+// LogEvent messages can be returned from any of the Rust service instances.
+// They each represent a log that should be immediately published to an ops log collection.
+message LogEvent {
+  LogLevel level = 1;
+  // Optional structured logging fields, which is semantically equivalent to a JSON object.
+  google.protobuf.Struct fields = 2;
+  // Human readable message to be logged.
+  string message = 3;
+}
+
+// DocsAndBytes represents a count of JSON documents, and their cumulative total size in bytes.
+// This is used by the various Stats messages.
+message DocsAndBytes {
+  uint64 docs = 1;
+  uint64 bytes = 2;
 }
 
 // IngestRequest describes documents to ingest into collections.

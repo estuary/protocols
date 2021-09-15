@@ -35,10 +35,13 @@ protoc-gen-gogo:
 
 # Run the protobuf compiler to generate message and gRPC service implementations.
 # Invoke protoc with local and third-party include paths set.
+# The M_ option in gogo_out is some weird crap that allows using the imported struct type with gogo.
+# I have no idea how or why it works, but I took it from this GH comment: 
+# https://github.com/gogo/protobuf/issues/325#issuecomment-335144716
 %.pb.go: %.proto protoc-gen-gogo
 	PATH=$$PATH:$(shell go env GOPATH)/bin \
 	protoc -I . $(foreach module, $(PROTOC_INC_GO_MODULES), -I$(GO_MODULE_PATH)) \
-		--gogo_out=paths=source_relative,plugins=grpc:. $*.proto
+		--gogo_out=paths=source_relative,Mgoogle/protobuf/struct.proto=github.com/gogo/protobuf/types,plugins=grpc:. $*.proto
 
 go-protobufs: $(GO_PROTO_TARGETS)
 
