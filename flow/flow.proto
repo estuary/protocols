@@ -3,7 +3,6 @@ syntax = "proto3";
 package flow;
 option go_package = "github.com/estuary/protocols/flow";
 
-import "google/protobuf/struct.proto";
 import "broker/protocol/protocol.proto";
 import "consumer/protocol/protocol.proto";
 import "gogoproto/gogo.proto";
@@ -932,8 +931,10 @@ enum LogLevel {
 // They each represent a log that should be immediately published to an ops log collection.
 message LogEvent {
   LogLevel level = 1;
-  // Optional structured logging fields, which is semantically equivalent to a JSON object.
-  google.protobuf.Struct fields = 2;
+  // Optional structured logging fields, serialized as a JSON object.
+  string fields_json = 2 [
+    (gogoproto.casttype) = "encoding/json.RawMessage"
+  ];
   // Human readable message to be logged.
   string message = 3;
 }
