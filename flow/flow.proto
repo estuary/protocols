@@ -624,8 +624,9 @@ message ExtractAPI {
     EXTRACTED_UUID = 3;
     // Fields extracted from a document (Rust -> Go).
     EXTRACTED_FIELDS = 4;
-    // A Log message to be published (Rust -> Go)
-    LOG = 5;
+    // A Log message to be published (Rust -> Go). Note that all LOG messages use the same Code for
+    // all service types.
+    LOG = 109;
   }
 
   message Config {
@@ -674,10 +675,11 @@ message CombineAPI {
     DRAINED_KEY = 7;
     // Next drained fields (follows key; Rust -> Go).
     DRAINED_FIELDS = 8;
-    // A Log message to be published (Rust -> Go)
-    LOG = 9;
     // Drain stats, sent after all documents have been drained. (Rust -> Go)
-    STATS = 10;
+    STATS = 9;
+    // A Log message to be published (Rust -> Go). Note that all LOG messages use the same Code for
+    // all service types.
+    LOG = 109;
   };
 
   message Config {
@@ -754,10 +756,11 @@ message DeriveAPI {
     PREPARE_TO_COMMIT = 14;
     // Clear registers values (test support only; Go -> Rust).
     CLEAR_REGISTERS = 15;
-    // A Log message to be published (Rust -> Go)
-    LOG = 16;
     // Drain stats, sent after all documents have been drained. (Rust -> Go)
-    STATS = 17;
+    STATS = 16;
+    // A Log message to be published (Rust -> Go). Note that all LOG messages use the same Code for
+    // all service types.
+    LOG = 109;
   };
 
   // Open the registers database.
@@ -937,6 +940,14 @@ message LogEvent {
   ];
   // Human readable message to be logged.
   string message = 3;
+
+  // elapsed_nanos represents the duration from the start of the invocation.
+  // Log events must ultimately end up with a timestamp. This raises some questions about uniqueness
+  // and monotonicity when integrating logs from both Go and Rust into the same collection. So to
+  // avoid any potential issues, we generate all the actual timestamps on the Go side. Go will mark
+  // the current time before making each call, and then add this duration to that time to come up
+  // with the timestamp for each log event it processes from Rust.
+  uint64 elapsed_nanos = 4;
 }
 
 // DocsAndBytes represents a count of JSON documents, and their cumulative total size in bytes.
