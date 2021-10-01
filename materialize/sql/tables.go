@@ -13,10 +13,17 @@ const (
 	DefaultFlowMaterializations = "flow_materializations_v2"
 )
 
+// FlowTables is the table specifications for Flow
+type FlowTables struct {
+	Checkpoints *Table // Table of Flow checkpoints.
+	Specs       *Table // Table of MaterializationSpecs.
+}
+
 // FlowCheckpointsTable returns the Table description for the table that holds the checkpoint
 // and nonce values for each materialization shard.
 func FlowCheckpointsTable(name string) *Table {
 	return &Table{
+		Name:        name,
 		Identifier:  name,
 		IfNotExists: true,
 		Comment:     "This table holds Flow processing checkpoints used for exactly-once processing of materializations",
@@ -67,6 +74,7 @@ func FlowCheckpointsTable(name string) *Table {
 // generation and for validation.
 func FlowMaterializationsTable(name string) *Table {
 	return &Table{
+		Name:        name,
 		Identifier:  name,
 		IfNotExists: true,
 		Comment:     "This table is the source of truth for all materializations into this system.",

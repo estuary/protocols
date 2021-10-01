@@ -1,7 +1,6 @@
 package sql
 
 import (
-	"bufio"
 	"fmt"
 	"strings"
 
@@ -10,7 +9,7 @@ import (
 
 // ColumnType represents a minimal set of database-agnostic types that we may try to store and
 // query. This set of types is slightly different than the set of JSON types. This has a "binary"
-// type for dealing with byte slices, and there is no "null" type, since nullability is modeleed
+// type for dealing with byte slices, and there is no "null" type, since nullability is modeled
 // separately.
 type ColumnType string
 
@@ -56,10 +55,10 @@ type Column struct {
 
 // Table describes a database table, which can be used to generate various types of SQL statements.
 type Table struct {
+	// The Name of the table which can be used when referencing the original name of the table.
+	Name string
 	// Identifier is the final form of the table name, exactly as it should be represented in SQL
-	// statements. If quoting is necessary, then the quotes must be included here. Unlike Columns,
-	// Tables do not have a separate Name field, as we have no need to reference them by name during
-	// SQL generation.
+	// statements. If quoting is necessary, then the quotes must be included here.
 	Identifier string
 	// Optional Comment to add to create table statements.
 	Comment string
@@ -123,35 +122,6 @@ func newParametersConverter(mapper TypeMapper, table *Table, columns []string) (
 		converters[i] = ty.ValueConverter
 	}
 	return ParametersConverter(converters), nil
-}
-
-// TokenPair is a generic way of representing strings that can be used to surround some text for
-// quoting and commenting.
-type TokenPair struct {
-	Left  string
-	Right string
-}
-
-// Wrap returns the given string surrounded by the strings in this TokenPair.
-func (p *TokenPair) Wrap(text string) string {
-	var b strings.Builder
-	p.writeWrapped(&b, text)
-	return b.String()
-}
-
-func (p *TokenPair) writeWrapped(builder *strings.Builder, text string) {
-	builder.WriteString(p.Left)
-	builder.WriteString(text)
-	builder.WriteString(p.Right)
-}
-
-// DoubleQuotes returns a TokenPair with a single double quote character on the both the Left and
-// the Right.
-func DoubleQuotes() TokenPair {
-	return TokenPair{
-		Left:  "\"",
-		Right: "\"",
-	}
 }
 
 // Identity is an identity function for no-op conversions of tuple elements to `interface{}` values
@@ -233,7 +203,7 @@ func (c MaxLengthableColumnType) GetColumnType(col *Column) (*ResolvedColumnType
 
 // NullableTypeMapping wraps a TypeMapper to add "NULL" and/or "NOT NULL" to the generated SQL type
 // depending on the nullability of the column. Most databases will assume that a column may contain
-// null as long as it isnt' declared with a NOT NULL constraint, but some databases (e.g. ms sql
+// null as long as it isn't declared with a NOT NULL constraint, but some databases (e.g. ms sql
 // server) make that behavior configurable, requiring the DDL to explicitly declare a column with
 // NULL if it may contain null values. This wrapper will handle either or both cases.
 type NullableTypeMapping struct {
@@ -323,11 +293,13 @@ func LineComment() CommentConfig {
 // Generator generates SQL for a large variety of SQL dialects using various
 // configuration parameters.
 type Generator struct {
-	CommentConf      CommentConfig
-	IdentifierQuotes TokenPair
-	Placeholder      func(int) string
-	QuoteStringValue func(string) string
-	TypeMappings     TypeMapper
+	Placeholder         func(int) string
+	CommentRenderer     *CommentRenderer
+	IdentifierRenderer  *Renderer
+	ValueRenderer       *Renderer
+	TypeMappings        TypeMapper
+	SkipIndexes         bool // Skip creating indexes on tables
+	SkipDDLTransactions bool // Skip transactions for DDL statements (CREATE/ALTER TABLE)
 }
 
 // PostgresParameterPlaceholder returns $N style parameters where N is the parameter number
@@ -342,31 +314,8 @@ func QuestionMarkPlaceholder(_ int) string {
 	return "?"
 }
 
-// DefaultQuoteStringValue surrounds the given string with single quotes and escapes any single
-// quote characters within the string by doubling them. This works for well enough for most
-// databases, since we're not super concerned about sql injection edge cases here (the user already has
-// database credentials, after all).
-func DefaultQuoteStringValue(value string) string {
-	var builder strings.Builder
-	builder.WriteRune('\'')
-	var val = value
-	for {
-		var idx = strings.IndexByte(val, byte('\''))
-		if idx == -1 {
-			builder.WriteString(val)
-			break
-		} else {
-			builder.WriteString(val[0:idx])
-			builder.WriteString("''")
-			val = val[idx+1:] // safe because we know there's a single quote char there
-		}
-	}
-	builder.WriteRune('\'')
-	return builder.String()
-}
-
 // SQLiteSQLGenerator returns a SQLGenerator for the sqlite SQL dialect.
-func SQLiteSQLGenerator() Generator {
+func SQLiteSQLGenerator() *Generator {
 	var typeMappings = ColumnTypeMapper{
 		INTEGER: RawConstColumnType("INTEGER"),
 		NUMBER:  RawConstColumnType("REAL"),
@@ -383,17 +332,25 @@ func SQLiteSQLGenerator() Generator {
 		Inner:       typeMappings,
 	}
 
-	return Generator{
-		CommentConf:      LineComment(),
-		IdentifierQuotes: DoubleQuotes(),
-		Placeholder:      QuestionMarkPlaceholder,
-		TypeMappings:     nullable,
-		QuoteStringValue: DefaultQuoteStringValue,
+	return &Generator{
+		CommentRenderer: LineCommentRenderer(),
+		IdentifierRenderer: &Renderer{
+			Sanitizer:   nil,
+			Wrapper:     DoubleQuotes().Wrap,
+			SkipWrapper: DefaultUnwrappedIdentifiers.MatchString,
+		},
+		ValueRenderer: &Renderer{
+			Sanitizer:   strings.NewReplacer("'", "''").Replace, // Convert single quotes into 2 single
+			Wrapper:     SingleQuotes().Wrap,
+			SkipWrapper: DefaultUnwrappedIdentifiers.MatchString,
+		},
+		Placeholder:  QuestionMarkPlaceholder,
+		TypeMappings: nullable,
 	}
 }
 
 // PostgresSQLGenerator returns a SQLGenerator for the postgresql SQL dialect.
-func PostgresSQLGenerator() Generator {
+func PostgresSQLGenerator() *Generator {
 	var typeMappings TypeMapper = NullableTypeMapping{
 		NotNullText: "NOT NULL",
 		Inner: ColumnTypeMapper{
@@ -409,21 +366,21 @@ func PostgresSQLGenerator() Generator {
 		},
 	}
 
-	return Generator{
-		CommentConf:      LineComment(),
-		IdentifierQuotes: DoubleQuotes(),
-		Placeholder:      PostgresParameterPlaceholder,
-		TypeMappings:     typeMappings,
-		QuoteStringValue: DefaultQuoteStringValue,
+	return &Generator{
+		CommentRenderer: LineCommentRenderer(),
+		IdentifierRenderer: &Renderer{
+			Sanitizer:   nil,
+			Wrapper:     DoubleQuotes().Wrap,
+			SkipWrapper: DefaultUnwrappedIdentifiers.MatchString,
+		},
+		ValueRenderer: &Renderer{
+			Sanitizer:   strings.NewReplacer("'", "''").Replace, // Convert single quotes into 2 single
+			Wrapper:     SingleQuotes().Wrap,
+			SkipWrapper: DefaultUnwrappedIdentifiers.MatchString,
+		},
+		Placeholder:  PostgresParameterPlaceholder,
+		TypeMappings: typeMappings,
 	}
-}
-
-// Comment returns a new string with a comment containing the given string. The returned string
-// must always end with a newline. The comment can either be a line or a block comment.
-func (gen *Generator) Comment(text string) string {
-	var builder strings.Builder
-	gen.writeComment(&builder, text, "")
-	return builder.String()
 }
 
 // CreateTable generates a CREATE TABLE statement for the given table. The returned statement must
@@ -432,7 +389,7 @@ func (gen *Generator) CreateTable(table *Table) (string, error) {
 	var builder strings.Builder
 
 	if len(table.Comment) > 0 {
-		gen.writeComment(&builder, table.Comment, "")
+		gen.CommentRenderer.Write(&builder, table.Comment, "")
 	}
 
 	builder.WriteString("CREATE ")
@@ -451,9 +408,9 @@ func (gen *Generator) CreateTable(table *Table) (string, error) {
 			builder.WriteString(",\n\t")
 		}
 		if len(column.Comment) > 0 {
-			gen.writeComment(&builder, column.Comment, "\t")
+			gen.CommentRenderer.Write(&builder, column.Comment, "\t")
 			// The comment will always end with a newline, but we'll need to add the indentation
-			// for the next line. If there's no comment, then the indentation will aready be there.
+			// for the next line. If there's no comment, then the indentation will already be there.
 			builder.WriteRune('\t')
 		}
 		builder.WriteString(column.Identifier)
@@ -465,19 +422,26 @@ func (gen *Generator) CreateTable(table *Table) (string, error) {
 		}
 		builder.WriteString(resolved.SQLType)
 	}
-	builder.WriteString(",\n\n\tPRIMARY KEY(")
-	var firstPk = true
-	for _, column := range table.Columns {
-		if column.PrimaryKey {
-			if !firstPk {
-				builder.WriteString(", ")
+
+	if !gen.SkipIndexes {
+		builder.WriteString(",\n\n\tPRIMARY KEY(")
+		var firstPk = true
+		for _, column := range table.Columns {
+			if column.PrimaryKey {
+				if !firstPk {
+					builder.WriteString(", ")
+				}
+				firstPk = false
+				builder.WriteString(column.Identifier)
 			}
-			firstPk = false
-			builder.WriteString(column.Identifier)
 		}
+		// Close the primary key paren, then newline
+		builder.WriteString(")\n")
 	}
-	// Close the primary key paren, then newline and close the create table statement
-	builder.WriteString(")\n)")
+
+	// close the create table statement
+	builder.WriteString(")")
+
 	if table.Temporary && table.TempOnCommit != "" {
 		builder.WriteString(" ON COMMIT ")
 		builder.WriteString(table.TempOnCommit)
@@ -606,35 +570,4 @@ func (gen *Generator) UpdateStatement(table *Table, setColumns []string, whereCo
 	var converters = ParametersConverter(append(setConverters, valConverters...))
 
 	return builder.String(), converters, nil
-}
-
-func (gen *Generator) writeComment(builder *strings.Builder, text string, indent string) {
-	var comment = gen.CommentConf
-	var scanner = bufio.NewScanner(strings.NewReader(text))
-
-	if comment.Linewise {
-		var first = true
-		for scanner.Scan() {
-			if !first {
-				builder.WriteRune('\n')
-				builder.WriteString(indent)
-			}
-			first = false
-			comment.Wrap.writeWrapped(builder, scanner.Text())
-		}
-	} else {
-		builder.WriteString(gen.CommentConf.Wrap.Left)
-		var first = true
-		for scanner.Scan() {
-			if !first {
-				builder.WriteRune('\n')
-				builder.WriteString(indent)
-			}
-			first = false
-			builder.WriteString(scanner.Text())
-		}
-		builder.WriteString(gen.CommentConf.Wrap.Right)
-	}
-	// Comments always end with a newline
-	builder.WriteRune('\n')
 }

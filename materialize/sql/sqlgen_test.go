@@ -9,33 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestIdentifierQuoting(t *testing.T) {
-	var quotes = &TokenPair{
-		Left:  "L",
-		Right: "R",
-	}
-	var quote = []string{
-		"f o o",
-		"3two_one",
-		"wello$horld",
-		"a/b",
-	}
-	for _, name := range quote {
-		require.Equal(t, "L"+name+"R", toIdentifier(name, quotes))
-	}
-
-	var noQuote = []string{
-		"FOO",
-		"foo",
-		"没有双引号",
-		"_bar",
-		"one_2_3",
-	}
-	for _, name := range noQuote {
-		require.Equal(t, name, toIdentifier(name, quotes))
-	}
-}
-
 func TestSQLGenerator(t *testing.T) {
 	var testTable = testTable()
 	var flowCheckpoints = FlowCheckpointsTable(DefaultFlowCheckpoints)
@@ -44,7 +17,7 @@ func TestSQLGenerator(t *testing.T) {
 
 	var pgGen = PostgresSQLGenerator()
 	var sqliteGen = SQLiteSQLGenerator()
-	var generators = map[string]Generator{
+	var generators = map[string]*Generator{
 		"postgres": pgGen,
 		"sqlite":   sqliteGen,
 	}
@@ -78,19 +51,6 @@ func TestSQLGenerator(t *testing.T) {
 				cupaloy.SnapshotT(t, allSQL)
 			})
 		}
-	}
-}
-
-func TestDefaultQuoteStringValue(t *testing.T) {
-	var testCases = map[string]string{
-		"foo":            "'foo'",
-		"he's 'bouta go": "'he''s ''bouta go'",
-		"'moar quotes'":  "'''moar quotes'''",
-		"":               "''",
-	}
-	for input, expected := range testCases {
-		var actual = DefaultQuoteStringValue(input)
-		require.Equal(t, expected, actual)
 	}
 }
 

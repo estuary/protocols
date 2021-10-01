@@ -40,11 +40,11 @@ type Driver struct {
 	// Instance of the type into which resource specifications are parsed.
 	ResourceSpecType Resource
 	// NewEndpoint returns an Endpoint, which will be used to handle interactions with the database.
-	NewEndpoint func(context.Context, json.RawMessage) (*Endpoint, error)
+	NewEndpoint func(context.Context, json.RawMessage) (Endpoint, error)
 	// NewResource returns an uninitialized Resource which may be parsed into.
-	NewResource func(ep *Endpoint) Resource
+	NewResource func(ep Endpoint) Resource
 	// NewTransactor returns a Transactor ready for pm.RunTransactions.
-	NewTransactor func(*Endpoint, *pf.MaterializationSpec, *Fence, []Resource) (pm.Transactor, error)
+	NewTransactor func(context.Context, Endpoint, *pf.MaterializationSpec, *Fence, []Resource) (pm.Transactor, error)
 }
 
 var _ pm.DriverServer = &Driver{}
@@ -86,7 +86,7 @@ func (d *Driver) Validate(ctx context.Context, req *pm.ValidateRequest) (*pm.Val
 		return nil, fmt.Errorf("building endpoint: %w", err)
 	}
 	// Load existing bindings indexed under their target table.
-	_, existing, err := indexBindings(d, endpoint, req.Materialization)
+	_, existing, err := indexBindings(ctx, d, endpoint, req.Materialization)
 	if err != nil {
 		return nil, err
 	}
@@ -136,17 +136,17 @@ func (d *Driver) Apply(ctx context.Context, req *pm.ApplyRequest) (*pm.ApplyResp
 		return nil, fmt.Errorf("building endpoint: %w", err)
 	}
 	// Load existing bindings indexed under their target table.
-	loaded, existing, err := indexBindings(d, endpoint, req.Materialization.Materialization)
+	loaded, existing, err := indexBindings(ctx, d, endpoint, req.Materialization.Materialization)
 	if err != nil {
 		return nil, err
 	}
 
 	// Create the materializations & checkpoints tables, if they don't exist.
-	createCheckpointsSQL, err := endpoint.Generator.CreateTable(endpoint.Tables.Checkpoints)
+	createCheckpointsSQL, err := endpoint.GetGenerator().CreateTable(endpoint.GetFlowTables().Checkpoints)
 	if err != nil {
 		return nil, fmt.Errorf("generating checkpoints schema: %w", err)
 	}
-	createSpecsSQL, err := endpoint.Generator.CreateTable(endpoint.Tables.Specs)
+	createSpecsSQL, err := endpoint.GetGenerator().CreateTable(endpoint.GetFlowTables().Specs)
 	if err != nil {
 		return nil, fmt.Errorf("generating specs schema: %w", err)
 	}
@@ -163,41 +163,78 @@ func (d *Driver) Apply(ctx context.Context, req *pm.ApplyRequest) (*pm.ApplyResp
 		panic(err) // Cannot fail.
 	}
 	upsertSpecSQL = fmt.Sprintf(upsertSpecSQL,
-		endpoint.Tables.Specs.Identifier,
+		endpoint.GetFlowTables().Specs.Identifier,
 		// Note that each version of upsertSpecSQL takes parameters in the same order.
-		endpoint.Generator.QuoteStringValue(req.Version),
-		endpoint.Generator.QuoteStringValue(base64.StdEncoding.EncodeToString(specBytes)),
-		endpoint.Generator.QuoteStringValue(req.Materialization.Materialization.String()),
+		endpoint.GetGenerator().ValueRenderer.Render(req.Version),
+		endpoint.GetGenerator().ValueRenderer.Render(base64.StdEncoding.EncodeToString(specBytes)),
+		endpoint.GetGenerator().ValueRenderer.Render(req.Materialization.Materialization.String()),
 	)
 
-	var statements = []string{
-		createCheckpointsSQL,
-		createSpecsSQL,
-		upsertSpecSQL,
-	}
-
-	// Validate and build SQL statements to apply each binding.
+	// Validate and build the SQL statements to apply each binding.
+	var applyBindingStatements []string
 	for _, spec := range req.Materialization.Bindings {
 		if built, err := generateApplyStatements(endpoint, existing, spec); err != nil {
 			return nil, err
 		} else {
-			statements = append(statements, built...)
+			applyBindingStatements = append(applyBindingStatements, built...)
 		}
+	}
+
+	var transactions [][]string
+
+	// The database does not support table structure changes inside of transactions, apply all table changes as separate
+	// single statements which will omit creating a transaction for that statement.
+	if endpoint.GetGenerator().SkipDDLTransactions {
+		transactions = append(transactions,
+			[]string{createCheckpointsSQL},
+			[]string{createSpecsSQL},
+			[]string{upsertSpecSQL},
+		)
+		for _, applyStatement := range applyBindingStatements {
+			transactions = append(transactions, []string{applyStatement})
+		}
+
+		// Table structure changes are supported in transactions so create a single transaction with all table
+		// manipulation and spec upserts.
+	} else {
+
+		// Table creation/manipulation operations can take place in transactions
+		var statements = []string{
+			createCheckpointsSQL,
+			createSpecsSQL,
+			upsertSpecSQL,
+		}
+		statements = append(statements, applyBindingStatements...)
+		transactions = [][]string{statements} // Single transaction
+
 	}
 
 	// Apply the statements if not in DryRun.
 	if !req.DryRun {
-		if err = endpoint.ApplyStatements(statements); err != nil {
-			return nil, fmt.Errorf("applying schema updates: %w", err)
+		for _, statements := range transactions {
+			if err = endpoint.ExecuteStatements(ctx, statements); err != nil {
+				return nil, fmt.Errorf("applying schema updates: %w", err)
+			}
 		}
 	}
 
 	// Build and return a description of what happened (or would have happened).
 	return &pm.ApplyResponse{
-		ActionDescription: fmt.Sprintf(
-			"BEGIN;\n%s\nCOMMIT;\n",
-			strings.Join(statements, "\n\n"),
-		),
+		ActionDescription: func() string {
+			var desc strings.Builder
+			for _, transaction := range transactions {
+				if len(transaction) > 1 {
+					desc.WriteString("BEGIN;\n")
+					desc.WriteString(strings.Join(transaction, "\n\n"))
+					desc.WriteRune('\n')
+					desc.WriteString("END;\n")
+				} else {
+					desc.WriteString(transaction[0])
+					desc.WriteRune('\n')
+				}
+			}
+			return desc.String()
+		}(),
 	}, nil
 }
 
@@ -220,7 +257,7 @@ func (d *Driver) Transactions(stream pm.Driver_TransactionsServer) error {
 
 	// Verify the opened materialization has been applied to the database,
 	// and that the versions match.
-	if version, spec, err := endpoint.LoadSpec(open.Open.Materialization.Materialization); err != nil {
+	if version, spec, err := endpoint.LoadSpec(stream.Context(), open.Open.Materialization.Materialization); err != nil {
 		return fmt.Errorf("loading materialization spec: %w", err)
 	} else if spec == nil {
 		return fmt.Errorf("materialization has not been applied")
@@ -231,6 +268,7 @@ func (d *Driver) Transactions(stream pm.Driver_TransactionsServer) error {
 	}
 
 	fence, err := endpoint.NewFence(
+		stream.Context(),
 		open.Open.Materialization.Materialization,
 		open.Open.KeyBegin,
 		open.Open.KeyEnd,
@@ -254,7 +292,7 @@ func (d *Driver) Transactions(stream pm.Driver_TransactionsServer) error {
 	}
 
 	transactor, err := d.NewTransactor(
-		endpoint, open.Open.Materialization, fence, resources)
+		stream.Context(), endpoint, open.Open.Materialization, fence, resources)
 	if err != nil {
 		return err
 	}
@@ -298,14 +336,14 @@ func loadConstraints(
 // Index the binding specifications of the persisted materialization |name|,
 // keyed on the Resource.TargetName() of each binding.
 // If |name| isn't persisted, an empty map is returned.
-func indexBindings(d *Driver, ep *Endpoint, name pf.Materialization) (
+func indexBindings(ctx context.Context, d *Driver, ep Endpoint, name pf.Materialization) (
 	*pf.MaterializationSpec,
 	map[string]*pf.MaterializationSpec_Binding,
 	error,
 ) {
 	var index = make(map[string]*pf.MaterializationSpec_Binding)
 
-	var _, loaded, err = ep.LoadSpec(name)
+	var _, loaded, err = ep.LoadSpec(ctx, name)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading previously-stored spec: %w", err)
 	} else if loaded == nil {
