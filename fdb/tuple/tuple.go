@@ -285,7 +285,7 @@ func (p *packer) encodeInt(i int64) {
 func (p *packer) encodeBigInt(i *big.Int) {
 	length := len(i.Bytes())
 	if length > 0xff {
-		panic(fmt.Sprintf("Integer magnitude is too large (more than 255 bytes)"))
+		panic("Integer magnitude is too large (more than 255 bytes)")
 	}
 
 	if i.Sign() >= 0 {

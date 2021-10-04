@@ -19,6 +19,14 @@ type FlowTables struct {
 	Specs       *Table // Table of MaterializationSpecs.
 }
 
+// DefaultFlowTables returns the default Flow *Table configurations and names.
+func DefaultFlowTables() FlowTables {
+	return FlowTables{
+		Checkpoints: FlowCheckpointsTable(DefaultFlowCheckpoints),
+		Specs:       FlowMaterializationsTable(DefaultFlowMaterializations),
+	}
+}
+
 // FlowCheckpointsTable returns the Table description for the table that holds the checkpoint
 // and nonce values for each materialization shard.
 func FlowCheckpointsTable(name string) *Table {

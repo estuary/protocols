@@ -142,11 +142,11 @@ func (d *Driver) Apply(ctx context.Context, req *pm.ApplyRequest) (*pm.ApplyResp
 	}
 
 	// Create the materializations & checkpoints tables, if they don't exist.
-	createCheckpointsSQL, err := endpoint.GetGenerator().CreateTable(endpoint.GetFlowTables().Checkpoints)
+	createCheckpointsSQL, err := endpoint.CreateTableStatement(endpoint.FlowTables().Checkpoints)
 	if err != nil {
 		return nil, fmt.Errorf("generating checkpoints schema: %w", err)
 	}
-	createSpecsSQL, err := endpoint.GetGenerator().CreateTable(endpoint.GetFlowTables().Specs)
+	createSpecsSQL, err := endpoint.CreateTableStatement(endpoint.FlowTables().Specs)
 	if err != nil {
 		return nil, fmt.Errorf("generating specs schema: %w", err)
 	}
@@ -162,79 +162,45 @@ func (d *Driver) Apply(ctx context.Context, req *pm.ApplyRequest) (*pm.ApplyResp
 	if err != nil {
 		panic(err) // Cannot fail.
 	}
+
+	generator := endpoint.Generator()
+
 	upsertSpecSQL = fmt.Sprintf(upsertSpecSQL,
-		endpoint.GetFlowTables().Specs.Identifier,
+		endpoint.FlowTables().Specs.Identifier,
 		// Note that each version of upsertSpecSQL takes parameters in the same order.
-		endpoint.GetGenerator().ValueRenderer.Render(req.Version),
-		endpoint.GetGenerator().ValueRenderer.Render(base64.StdEncoding.EncodeToString(specBytes)),
-		endpoint.GetGenerator().ValueRenderer.Render(req.Materialization.Materialization.String()),
+		generator.IdentifierRenderer.Render(req.Version),
+		generator.IdentifierRenderer.Render(base64.StdEncoding.EncodeToString(specBytes)),
+		generator.IdentifierRenderer.Render(req.Materialization.Materialization.String()),
 	)
 
 	// Validate and build the SQL statements to apply each binding.
 	var applyBindingStatements []string
 	for _, spec := range req.Materialization.Bindings {
 		if built, err := generateApplyStatements(endpoint, existing, spec); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("building statement for binding %s: %w", ResourcePath(spec.ResourcePath).Join(), err)
 		} else {
 			applyBindingStatements = append(applyBindingStatements, built...)
 		}
 	}
 
-	var transactions [][]string
-
-	// The database does not support table structure changes inside of transactions, apply all table changes as separate
-	// single statements which will omit creating a transaction for that statement.
-	if endpoint.GetGenerator().SkipDDLTransactions {
-		transactions = append(transactions,
-			[]string{createCheckpointsSQL},
-			[]string{createSpecsSQL},
-			[]string{upsertSpecSQL},
-		)
-		for _, applyStatement := range applyBindingStatements {
-			transactions = append(transactions, []string{applyStatement})
-		}
-
-		// Table structure changes are supported in transactions so create a single transaction with all table
-		// manipulation and spec upserts.
-	} else {
-
-		// Table creation/manipulation operations can take place in transactions
-		var statements = []string{
-			createCheckpointsSQL,
-			createSpecsSQL,
-			upsertSpecSQL,
-		}
-		statements = append(statements, applyBindingStatements...)
-		transactions = [][]string{statements} // Single transaction
-
+	// Table creation/manipulation operations can take place in transactions
+	var statements = []string{
+		createCheckpointsSQL,
+		createSpecsSQL,
+		upsertSpecSQL,
 	}
+	statements = append(statements, applyBindingStatements...)
 
 	// Apply the statements if not in DryRun.
 	if !req.DryRun {
-		for _, statements := range transactions {
-			if err = endpoint.ExecuteStatements(ctx, statements); err != nil {
-				return nil, fmt.Errorf("applying schema updates: %w", err)
-			}
+		if err = endpoint.ExecuteStatements(ctx, statements); err != nil {
+			return nil, fmt.Errorf("applying schema updates: %w", err)
 		}
 	}
 
 	// Build and return a description of what happened (or would have happened).
 	return &pm.ApplyResponse{
-		ActionDescription: func() string {
-			var desc strings.Builder
-			for _, transaction := range transactions {
-				if len(transaction) > 1 {
-					desc.WriteString("BEGIN;\n")
-					desc.WriteString(strings.Join(transaction, "\n\n"))
-					desc.WriteRune('\n')
-					desc.WriteString("END;\n")
-				} else {
-					desc.WriteString(transaction[0])
-					desc.WriteRune('\n')
-				}
-			}
-			return desc.String()
-		}(),
+		ActionDescription: "BEGIN\n" + strings.Join(statements, "\n\n") + "\nEND;",
 	}, nil
 }
 

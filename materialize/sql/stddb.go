@@ -5,56 +5,79 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"fmt"
+	"strings"
 
 	pf "github.com/estuary/protocols/flow"
 	pm "github.com/estuary/protocols/materialize"
 	log "github.com/sirupsen/logrus"
 )
 
-// SqlDbEndpoint is the *database/sql.DB implementation of an endpoint
-type SqlDbEndpoint struct {
+// StdEndpoint is the *database/sql.DB standard implementation of an endpoint
+type StdEndpoint struct {
 	// Parsed configuration of this Endpoint, as a driver-specific type.
-	Config interface{}
+	config interface{}
 	// Endpoint opened as driver/sql DB.
-	DB *sql.DB
+	db *sql.DB
 	// Generator of SQL for this endpoint.
-	Generator *Generator
+	generator Generator
 	// FlowTables
-	FlowTables *FlowTables
+	flowTables FlowTables
 }
 
-func (e *SqlDbEndpoint) GetGenerator() *Generator {
-	return e.Generator
+// NewStdEndpoint composes a new StdEndpoint
+func NewStdEndpoint(config interface{}, db *sql.DB, generator Generator, flowTables FlowTables) *StdEndpoint {
+	return &StdEndpoint{
+		config:     config,
+		db:         db,
+		generator:  generator,
+		flowTables: flowTables,
+	}
 }
 
-func (e *SqlDbEndpoint) GetFlowTables() *FlowTables {
-	return e.FlowTables
+// Config returns the endpoint's config value.
+func (e *StdEndpoint) Config() interface{} {
+	return e.config
+}
+
+// DB returns the embedded *sql.DB.
+func (e *StdEndpoint) DB() *sql.DB {
+	return e.db
+}
+
+// Generator returns the SQL generator.
+func (e *StdEndpoint) Generator() Generator {
+	return e.generator
+}
+
+// FlowTables returns the Flow Tables configurations.
+func (e *StdEndpoint) FlowTables() FlowTables {
+	return e.flowTables
 }
 
 // LoadSpec loads the named MaterializationSpec and its version that's stored within the Endpoint, if any.
-func (e *SqlDbEndpoint) LoadSpec(ctx context.Context, materialization pf.Materialization) (version string, _ *pf.MaterializationSpec, _ error) {
+func (e *StdEndpoint) LoadSpec(ctx context.Context, materialization pf.Materialization) (version string, _ *pf.MaterializationSpec, _ error) {
 
 	// Fail-fast: surface a connection issue.
-	if err := e.DB.PingContext(ctx); err != nil {
+	if err := e.db.PingContext(ctx); err != nil {
 		return "", nil, fmt.Errorf("connecting to DB: %w", err)
 	}
 
 	var specB64 string
 	var spec = new(pf.MaterializationSpec)
 
-	var err = e.DB.QueryRowContext(
+	var err = e.db.QueryRowContext(
 		ctx,
 		fmt.Sprintf(
 			"SELECT version, spec FROM %s WHERE materialization=%s;",
-			e.FlowTables.Specs.Identifier,
-			e.Generator.Placeholder(0),
+			e.flowTables.Specs.Identifier,
+			e.generator.Placeholder(0),
 		),
 		materialization.String(),
 	).Scan(&version, &specB64)
 
 	if err != nil {
 		log.WithFields(log.Fields{
-			"table": e.FlowTables.Specs.Identifier,
+			"table": e.flowTables.Specs.Identifier,
 			"err":   err,
 		}).Info("failed to query materialization spec (the table may not be initialized?)")
 		return "", nil, nil
@@ -70,40 +93,94 @@ func (e *SqlDbEndpoint) LoadSpec(ctx context.Context, materialization pf.Materia
 }
 
 // ExecuteStatements executes all of the statements provided in a single transaction.
-// It will skip a transaction if there is only one statement
-func (e *SqlDbEndpoint) ExecuteStatements(ctx context.Context, statements []string) error {
+func (e *StdEndpoint) ExecuteStatements(ctx context.Context, statements []string) error {
 
-	if len(statements) == 1 {
-		log.WithField("sql", statements[0]).Debug("executing single statement")
-		if _, err := e.DB.Exec(statements[0]); err != nil {
-			return fmt.Errorf("executing single statement: %w", err)
-		}
-	} else if len(statements) > 1 {
-		log.Debug("starting transaction")
-		var txn, err = e.DB.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("DB.BeginTx: %w", err)
-		}
-		for i, statement := range statements {
-			log.WithField("sql", statement).Debug("executing statement")
-			if _, err := txn.Exec(statement); err != nil {
-				_ = txn.Rollback()
-				return fmt.Errorf("executing statement %d: %w", i, err)
-			}
-		}
-		if err := txn.Commit(); err != nil {
-			return err
-		}
-		log.Debug("committed transaction")
+	log.Debug("starting transaction")
+	var txn, err = e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("DB.BeginTx: %w", err)
 	}
+	for i, statement := range statements {
+		log.WithField("sql", statement).Debug("executing statement")
+		if _, err := txn.Exec(statement); err != nil {
+			_ = txn.Rollback()
+			return fmt.Errorf("executing statement %d: %w", i, err)
+		}
+	}
+	if err := txn.Commit(); err != nil {
+		return err
+	}
+	log.Debug("committed transaction")
 	return nil
 
 }
 
+// CreateTableStatement generates a CREATE TABLE statement for the given table. The returned
+// statement must not contain any parameter placeholders.
+func (e *StdEndpoint) CreateTableStatement(table *Table) (string, error) {
+	var builder strings.Builder
+
+	if len(table.Comment) > 0 {
+		_, _ = e.generator.CommentRenderer.Write(&builder, table.Comment, "")
+	}
+
+	builder.WriteString("CREATE ")
+	if table.Temporary {
+		builder.WriteString("TEMPORARY ")
+	}
+	builder.WriteString("TABLE ")
+	if table.IfNotExists {
+		builder.WriteString("IF NOT EXISTS ")
+	}
+	builder.WriteString(table.Identifier)
+	builder.WriteString(" (\n\t")
+
+	for i, column := range table.Columns {
+		if i > 0 {
+			builder.WriteString(",\n\t")
+		}
+		if len(column.Comment) > 0 {
+			_, _ = e.generator.CommentRenderer.Write(&builder, column.Comment, "\t")
+			// The comment will always end with a newline, but we'll need to add the indentation
+			// for the next line. If there's no comment, then the indentation will already be there.
+			builder.WriteRune('\t')
+		}
+		builder.WriteString(column.Identifier)
+		builder.WriteRune(' ')
+
+		var resolved, err = e.generator.TypeMappings.GetColumnType(&column)
+		if err != nil {
+			return "", err
+		}
+		builder.WriteString(resolved.SQLType)
+	}
+
+	builder.WriteString(",\n\n\tPRIMARY KEY(")
+	var firstPk = true
+	for _, column := range table.Columns {
+		if column.PrimaryKey {
+			if !firstPk {
+				builder.WriteString(", ")
+			}
+			firstPk = false
+			builder.WriteString(column.Identifier)
+		}
+	}
+	// Close the primary key paren, table statement and then newline
+	builder.WriteString(")\n)\n")
+
+	if table.Temporary && table.TempOnCommit != "" {
+		builder.WriteString(" ON COMMIT ")
+		builder.WriteString(table.TempOnCommit)
+	}
+	builder.WriteRune(';')
+	return builder.String(), nil
+}
+
 // NewFence installs and returns a new *Fence. On return, all older fences of
 // this |shardFqn| have been fenced off from committing further transactions.
-func (e *SqlDbEndpoint) NewFence(ctx context.Context, materialization pf.Materialization, keyBegin, keyEnd uint32) (*Fence, error) {
-	var txn, err = e.DB.BeginTx(ctx, nil)
+func (e *StdEndpoint) NewFence(ctx context.Context, materialization pf.Materialization, keyBegin, keyEnd uint32) (*Fence, error) {
+	var txn, err = e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("db.BeginTx: %w", err)
 	}
@@ -124,10 +201,10 @@ func (e *SqlDbEndpoint) NewFence(ctx context.Context, materialization pf.Materia
 				AND key_begin<=%s
 			;
 			`,
-			e.FlowTables.Checkpoints.Identifier,
-			e.Generator.Placeholder(0),
-			e.Generator.Placeholder(1),
-			e.Generator.Placeholder(2),
+			e.flowTables.Checkpoints.Identifier,
+			e.generator.Placeholder(0),
+			e.generator.Placeholder(1),
+			e.generator.Placeholder(2),
 		),
 		materialization,
 		keyBegin,
@@ -153,10 +230,10 @@ func (e *SqlDbEndpoint) NewFence(ctx context.Context, materialization pf.Materia
 				LIMIT 1
 			;
 			`,
-			e.FlowTables.Checkpoints.Identifier,
-			e.Generator.Placeholder(0),
-			e.Generator.Placeholder(1),
-			e.Generator.Placeholder(2),
+			e.flowTables.Checkpoints.Identifier,
+			e.generator.Placeholder(0),
+			e.generator.Placeholder(1),
+			e.generator.Placeholder(2),
 		),
 		materialization,
 		keyBegin,
@@ -179,12 +256,12 @@ func (e *SqlDbEndpoint) NewFence(ctx context.Context, materialization pf.Materia
 	} else if _, err = txn.Exec(
 		fmt.Sprintf(
 			"INSERT INTO %s (materialization, key_begin, key_end, checkpoint, fence) VALUES (%s, %s, %s, %s, %s);",
-			e.FlowTables.Checkpoints.Identifier,
-			e.Generator.Placeholder(0),
-			e.Generator.Placeholder(1),
-			e.Generator.Placeholder(2),
-			e.Generator.Placeholder(3),
-			e.Generator.Placeholder(4),
+			e.flowTables.Checkpoints.Identifier,
+			e.generator.Placeholder(0),
+			e.generator.Placeholder(1),
+			e.generator.Placeholder(2),
+			e.generator.Placeholder(3),
+			e.generator.Placeholder(4),
 		),
 		materialization,
 		keyBegin,
@@ -210,12 +287,12 @@ func (e *SqlDbEndpoint) NewFence(ctx context.Context, materialization pf.Materia
 	// Craft SQL which is used for future commits under this fence.
 	var updateSQL = fmt.Sprintf(
 		"UPDATE %s SET checkpoint=%s WHERE materialization=%s AND key_begin=%s AND key_end=%s AND fence=%s;",
-		e.FlowTables.Checkpoints.Identifier,
-		e.Generator.Placeholder(0),
-		e.Generator.Placeholder(1),
-		e.Generator.Placeholder(2),
-		e.Generator.Placeholder(3),
-		e.Generator.Placeholder(4),
+		e.flowTables.Checkpoints.Identifier,
+		e.generator.Placeholder(0),
+		e.generator.Placeholder(1),
+		e.generator.Placeholder(2),
+		e.generator.Placeholder(3),
+		e.generator.Placeholder(4),
 	)
 
 	return &Fence{
@@ -230,17 +307,17 @@ func (e *SqlDbEndpoint) NewFence(ctx context.Context, materialization pf.Materia
 
 // UpdateFenceQuery returns the sql.DB compliant query+args suitable for updating the fence value from a transaction.
 // If this query does not affect any rows it should be considered failed and the fence has failed to update.
-func (e *SqlDbEndpoint) UpdateFence(fence *Fence) (string, []interface{}) {
+func (e *StdEndpoint) UpdateFence(fence *Fence) (string, []interface{}) {
 
 	// Craft SQL which is used for future commits under this fence.
 	return fmt.Sprintf(
 			"UPDATE %s SET checkpoint=%s WHERE materialization=%s AND key_begin=%s AND key_end=%s AND fence=%s;",
-			e.FlowTables.Checkpoints.Identifier,
-			e.Generator.Placeholder(0),
-			e.Generator.Placeholder(1),
-			e.Generator.Placeholder(2),
-			e.Generator.Placeholder(3),
-			e.Generator.Placeholder(4),
+			e.flowTables.Checkpoints.Identifier,
+			e.generator.Placeholder(0),
+			e.generator.Placeholder(1),
+			e.generator.Placeholder(2),
+			e.generator.Placeholder(3),
+			e.generator.Placeholder(4),
 		),
 		[]interface{}{
 			base64.StdEncoding.EncodeToString(fence.Checkpoint),

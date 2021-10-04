@@ -10,10 +10,7 @@ import (
 
 func TestRenderIdentifier(t *testing.T) {
 
-	r := &Renderer{
-		Wrapper:     NewTokenPair("L", "R").Wrap,
-		SkipWrapper: DefaultUnwrappedIdentifiers.MatchString,
-	}
+	r := NewRenderer(nil, NewTokenPair("L", "R").Wrap, DefaultUnwrappedIdentifiers)
 
 	var quote = []string{
 		"f o o",
@@ -40,11 +37,9 @@ func TestRenderIdentifier(t *testing.T) {
 }
 
 func TestRenderSQLQuoteValues(t *testing.T) {
-	r := &Renderer{
-		Sanitizer:   strings.NewReplacer("'", "''").Replace, // Convert single quotes into 2 single
-		Wrapper:     SingleQuotes().Wrap,
-		SkipWrapper: nil, // Wrap everything
-	}
+
+	r := NewRenderer(DefaultQuoteSanitizer, SingleQuotes().Wrap, nil)
+
 	var testCases = map[string]string{
 		"foo":            "'foo'",
 		"he's 'bouta go": "'he''s ''bouta go'",
@@ -58,19 +53,16 @@ func TestRenderSQLQuoteValues(t *testing.T) {
 }
 
 func TestRenderComplexWrapper(t *testing.T) {
-	r := &Renderer{
-		Sanitizer: strings.NewReplacer("/", "_").Replace, // Simple sanitizer
-		// Example that ensures "." separated terms are wrapped separately
-		Wrapper: func(text string) string {
-			wrapper := SingleQuotes()
-			terms := strings.Split(text, ".")
-			for i, t := range terms {
-				terms[i] = wrapper.Wrap(t)
-			}
-			return strings.Join(terms, ".")
-		},
-		SkipWrapper: nil, // Wrap everything
-	}
+
+	r := NewRenderer(strings.NewReplacer("/", "_").Replace, func(text string) string {
+		wrapper := SingleQuotes()
+		terms := strings.Split(text, ".")
+		for i, t := range terms {
+			terms[i] = wrapper.Wrap(t)
+		}
+		return strings.Join(terms, ".")
+	}, nil)
+
 	var testCases = map[string]string{
 		"table1":                       "'table1'",
 		"namespace.table2":             "'namespace'.'table2'",
@@ -97,10 +89,9 @@ func TestRenderComment(t *testing.T) {
 
 func TestCreateTableWithComments(t *testing.T) {
 
-	generator := PostgresSQLGenerator()
-	generator.CommentRenderer = LineCommentRenderer()
+	endpoint := NewStdEndpoint(nil, nil, PostgresSQLGenerator(), FlowTables{})
 
-	tableRender, err := generator.CreateTable(FlowCheckpointsTable("test"))
+	tableRender, err := endpoint.CreateTableStatement(FlowCheckpointsTable("test"))
 	require.Nil(t, err)
 
 	require.Equal(t, `-- This table holds Flow processing checkpoints used for exactly-once processing of materializations
