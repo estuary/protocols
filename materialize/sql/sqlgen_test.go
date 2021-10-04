@@ -15,18 +15,16 @@ func TestSQLGenerator(t *testing.T) {
 	var flowMaterializations = FlowMaterializationsTable(DefaultFlowMaterializations)
 	var allTables = []*Table{&testTable, flowCheckpoints, flowMaterializations}
 
-	var pgGen = PostgresSQLGenerator()
-	var sqliteGen = SQLiteSQLGenerator()
-	var generators = map[string]*Generator{
-		"postgres": pgGen,
-		"sqlite":   sqliteGen,
+	var endpoints = map[string]Endpoint{
+		"postgres": NewStdEndpoint(nil, nil, PostgresSQLGenerator(), FlowTables{}),
+		"sqlite":   NewStdEndpoint(nil, nil, SQLiteSQLGenerator(), FlowTables{}),
 	}
 
-	for dialect, gen := range generators {
+	for dialect, ep := range endpoints {
 		for _, table := range allTables {
 			// Test all the generic sql generation functions for each table
 			t.Run(fmt.Sprintf("%s_%s", dialect, table.Identifier), func(t *testing.T) {
-				var createTable, err = gen.CreateTable(table)
+				var createTable, err = ep.CreateTableStatement(table)
 				require.NoError(t, err)
 
 				// Store the Names of the key and value columns so we can reference them when
@@ -40,11 +38,11 @@ func TestSQLGenerator(t *testing.T) {
 						valueColumns = append(valueColumns, col.Name)
 					}
 				}
-				query, _, err := gen.QueryOnPrimaryKey(table, valueColumns...)
+				query, _, err := ep.Generator().QueryOnPrimaryKey(table, valueColumns...)
 				require.NoError(t, err)
-				insertStatement, _, err := gen.InsertStatement(table)
+				insertStatement, _, err := ep.Generator().InsertStatement(table)
 				require.NoError(t, err)
-				updateStatement, _, err := gen.UpdateStatement(table, valueColumns, keyColumns)
+				updateStatement, _, err := ep.Generator().UpdateStatement(table, valueColumns, keyColumns)
 				require.NoError(t, err)
 
 				var allSQL = strings.Join([]string{createTable, query, insertStatement, updateStatement}, "\n\n")

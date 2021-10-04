@@ -55,7 +55,7 @@ type Column struct {
 
 // Table describes a database table, which can be used to generate various types of SQL statements.
 type Table struct {
-	// The Name of the table which can be used when referencing the original name of the table.
+	// The Name of the table before sanitization and quoting.
 	Name string
 	// Identifier is the final form of the table name, exactly as it should be represented in SQL
 	// statements. If quoting is necessary, then the quotes must be included here.
@@ -125,7 +125,7 @@ func newParametersConverter(mapper TypeMapper, table *Table, columns []string) (
 }
 
 // Identity is an identity function for no-op conversions of tuple elements to `interface{}` values
-// that are suitable for use as sql parameters
+// that are suitable for use as sql parameters.
 func Identity(elem interface{}) (interface{}, error) {
 	return elem, nil
 }
@@ -293,13 +293,11 @@ func LineComment() CommentConfig {
 // Generator generates SQL for a large variety of SQL dialects using various
 // configuration parameters.
 type Generator struct {
-	Placeholder         func(int) string
-	CommentRenderer     *CommentRenderer
-	IdentifierRenderer  *Renderer
-	ValueRenderer       *Renderer
-	TypeMappings        TypeMapper
-	SkipIndexes         bool // Skip creating indexes on tables
-	SkipDDLTransactions bool // Skip transactions for DDL statements (CREATE/ALTER TABLE)
+	Placeholder        func(int) string
+	CommentRenderer    *CommentRenderer
+	IdentifierRenderer *Renderer
+	ValueRenderer      *Renderer
+	TypeMappings       TypeMapper
 }
 
 // PostgresParameterPlaceholder returns $N style parameters where N is the parameter number
@@ -309,13 +307,13 @@ func PostgresParameterPlaceholder(parameterIndex int) string {
 	return fmt.Sprintf("$%d", parameterIndex+1)
 }
 
-// QuestionMarkPlaceholder returns the constant string "?"
+// QuestionMarkPlaceholder returns the constant string "?".
 func QuestionMarkPlaceholder(_ int) string {
 	return "?"
 }
 
 // SQLiteSQLGenerator returns a SQLGenerator for the sqlite SQL dialect.
-func SQLiteSQLGenerator() *Generator {
+func SQLiteSQLGenerator() Generator {
 	var typeMappings = ColumnTypeMapper{
 		INTEGER: RawConstColumnType("INTEGER"),
 		NUMBER:  RawConstColumnType("REAL"),
@@ -332,25 +330,17 @@ func SQLiteSQLGenerator() *Generator {
 		Inner:       typeMappings,
 	}
 
-	return &Generator{
-		CommentRenderer: LineCommentRenderer(),
-		IdentifierRenderer: &Renderer{
-			Sanitizer:   nil,
-			Wrapper:     DoubleQuotes().Wrap,
-			SkipWrapper: DefaultUnwrappedIdentifiers.MatchString,
-		},
-		ValueRenderer: &Renderer{
-			Sanitizer:   strings.NewReplacer("'", "''").Replace, // Convert single quotes into 2 single
-			Wrapper:     SingleQuotes().Wrap,
-			SkipWrapper: DefaultUnwrappedIdentifiers.MatchString,
-		},
-		Placeholder:  QuestionMarkPlaceholder,
-		TypeMappings: nullable,
+	return Generator{
+		CommentRenderer:    LineCommentRenderer(),
+		IdentifierRenderer: NewRenderer(nil, DoubleQuotesWrapper(), DefaultUnwrappedIdentifiers),
+		ValueRenderer:      NewRenderer(DefaultQuoteSanitizer, SingleQuotesWrapper(), nil),
+		Placeholder:        QuestionMarkPlaceholder,
+		TypeMappings:       nullable,
 	}
 }
 
 // PostgresSQLGenerator returns a SQLGenerator for the postgresql SQL dialect.
-func PostgresSQLGenerator() *Generator {
+func PostgresSQLGenerator() Generator {
 	var typeMappings TypeMapper = NullableTypeMapping{
 		NotNullText: "NOT NULL",
 		Inner: ColumnTypeMapper{
@@ -366,88 +356,13 @@ func PostgresSQLGenerator() *Generator {
 		},
 	}
 
-	return &Generator{
-		CommentRenderer: LineCommentRenderer(),
-		IdentifierRenderer: &Renderer{
-			Sanitizer:   nil,
-			Wrapper:     DoubleQuotes().Wrap,
-			SkipWrapper: DefaultUnwrappedIdentifiers.MatchString,
-		},
-		ValueRenderer: &Renderer{
-			Sanitizer:   strings.NewReplacer("'", "''").Replace, // Convert single quotes into 2 single
-			Wrapper:     SingleQuotes().Wrap,
-			SkipWrapper: DefaultUnwrappedIdentifiers.MatchString,
-		},
-		Placeholder:  PostgresParameterPlaceholder,
-		TypeMappings: typeMappings,
+	return Generator{
+		CommentRenderer:    LineCommentRenderer(),
+		IdentifierRenderer: NewRenderer(nil, DoubleQuotesWrapper(), DefaultUnwrappedIdentifiers),
+		ValueRenderer:      NewRenderer(DefaultQuoteSanitizer, SingleQuotesWrapper(), nil),
+		Placeholder:        PostgresParameterPlaceholder,
+		TypeMappings:       typeMappings,
 	}
-}
-
-// CreateTable generates a CREATE TABLE statement for the given table. The returned statement must
-// not contain any parameter placeholders.
-func (gen *Generator) CreateTable(table *Table) (string, error) {
-	var builder strings.Builder
-
-	if len(table.Comment) > 0 {
-		gen.CommentRenderer.Write(&builder, table.Comment, "")
-	}
-
-	builder.WriteString("CREATE ")
-	if table.Temporary {
-		builder.WriteString("TEMPORARY ")
-	}
-	builder.WriteString("TABLE ")
-	if table.IfNotExists {
-		builder.WriteString("IF NOT EXISTS ")
-	}
-	builder.WriteString(table.Identifier)
-	builder.WriteString(" (\n\t")
-
-	for i, column := range table.Columns {
-		if i > 0 {
-			builder.WriteString(",\n\t")
-		}
-		if len(column.Comment) > 0 {
-			gen.CommentRenderer.Write(&builder, column.Comment, "\t")
-			// The comment will always end with a newline, but we'll need to add the indentation
-			// for the next line. If there's no comment, then the indentation will already be there.
-			builder.WriteRune('\t')
-		}
-		builder.WriteString(column.Identifier)
-		builder.WriteRune(' ')
-
-		var resolved, err = gen.TypeMappings.GetColumnType(&column)
-		if err != nil {
-			return "", err
-		}
-		builder.WriteString(resolved.SQLType)
-	}
-
-	if !gen.SkipIndexes {
-		builder.WriteString(",\n\n\tPRIMARY KEY(")
-		var firstPk = true
-		for _, column := range table.Columns {
-			if column.PrimaryKey {
-				if !firstPk {
-					builder.WriteString(", ")
-				}
-				firstPk = false
-				builder.WriteString(column.Identifier)
-			}
-		}
-		// Close the primary key paren, then newline
-		builder.WriteString(")\n")
-	}
-
-	// close the create table statement
-	builder.WriteString(")")
-
-	if table.Temporary && table.TempOnCommit != "" {
-		builder.WriteString(" ON COMMIT ")
-		builder.WriteString(table.TempOnCommit)
-	}
-	builder.WriteRune(';')
-	return builder.String(), nil
 }
 
 // QueryOnPrimaryKey generates a query that has a placeholder parameter for each primary key in
@@ -499,7 +414,7 @@ func (gen *Generator) InsertStatement(table *Table) (string, ParametersConverter
 	return gen.genInsertStatement(table, gen.Placeholder)
 }
 
-func (gen *Generator) genInsertStatement(table *Table, genParams func(int) string) (string, ParametersConverter, error) {
+func (gen Generator) genInsertStatement(table *Table, genParams func(int) string) (string, ParametersConverter, error) {
 	var builder strings.Builder
 	builder.WriteString("INSERT INTO ")
 	builder.WriteString(table.Identifier)

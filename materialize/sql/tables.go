@@ -13,10 +13,19 @@ const (
 	DefaultFlowMaterializations = "flow_materializations_v2"
 )
 
-// FlowTables is the table specifications for Flow
+// FlowTables is the table specifications for Flow.
 type FlowTables struct {
 	Checkpoints *Table // Table of Flow checkpoints.
 	Specs       *Table // Table of MaterializationSpecs.
+}
+
+// DefaultFlowTables returns the default Flow *Table configurations and names with optional prefix.
+// The prefix can be used to prepend pre-table identifiers such as schema names.
+func DefaultFlowTables(prefix string) FlowTables {
+	return FlowTables{
+		Checkpoints: FlowCheckpointsTable(prefix + DefaultFlowCheckpoints),
+		Specs:       FlowMaterializationsTable(prefix + DefaultFlowMaterializations),
+	}
 }
 
 // FlowCheckpointsTable returns the Table description for the table that holds the checkpoint
