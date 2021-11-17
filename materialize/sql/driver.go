@@ -373,14 +373,14 @@ func indexBindings(ctx context.Context, d *Driver, ep Endpoint, name pf.Material
 	_ map[string]*pf.MaterializationSpec_Binding,
 	_ error,
 ) {
+	var index = make(map[string]*pf.MaterializationSpec_Binding)
+
 	version, loaded, err := ep.LoadSpec(ctx, name)
 	if err != nil {
 		return nil, "", nil, fmt.Errorf("loading previously-stored spec: %w", err)
 	} else if loaded == nil {
-		return nil, "", nil, nil
+		return nil, "", index, nil
 	}
-
-	var index = make(map[string]*pf.MaterializationSpec_Binding)
 
 	for _, spec := range loaded.Bindings {
 		var r, err = parseResource(d.NewResource(ep), spec.ResourceSpecJson, &spec.Collection)
